@@ -13,7 +13,7 @@ from telegram.ext import (
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+#pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 BOT_TOKEN = "8927787436:AAHMMvz2e6qcMSklrKO7cDoSI1TaGKaPU3g"
 EXCEL_FILE_PATH = "dispatch_data.xlsx"
