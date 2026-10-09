@@ -13,10 +13,9 @@ from telegram.ext import (
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-# Commented out Windows path for Linux/Railway cloud environment
 # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-BOT_TOKEN = os.environ.get("8927787436:AAHMMvz2e6qcMSklrKO7cDoSI1TaGKaPU3g", "YOUR_TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.environ.get("8927787436:AAHMMvz2e6qcMSklrKO7cDoSI1TaGKaPU3g")
 EXCEL_FILE_PATH = "dispatch_data.xlsx"
 
 # Conversation States
@@ -111,17 +110,17 @@ def filter_by_shift(items, selected_shift):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
-        "👋 Welcome to Shipping Delay Tracker Bot!\n\n"
-        "To get started, please upload your Excel file (.xlsx or .xls)."
+        "👋 Hello! Welcome to Shipping Delay Tracking Bot.\n\n"
+        "To start, please send your Excel file (.xlsx) here."
     )
     return WAITING_FOR_EXCEL
 
 async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Restarts the session from scratch and asks for a new Excel file."""
+    """Resets current workflow session and prompts for a new Excel upload."""
     context.user_data.clear()
     await update.message.reply_text(
         "🔄 Session reset successfully!\n\n"
-        "Please upload a new Excel file (.xlsx or .xls) to start over."
+        "Please send your Excel file (.xlsx) to start over."
     )
     return WAITING_FOR_EXCEL
 
@@ -141,12 +140,12 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             "✅ Excel file saved successfully!\n\n"
-            "Please select the Shift:",
+            "Please select the Shift:", 
             reply_markup=reply_markup
         )
         return WAITING_FOR_SHIFT
     else:
-        await update.message.reply_text("⚠️ Invalid file format. Please upload an Excel file (.xlsx or .xls).")
+        await update.message.reply_text("⚠️ Please send a valid Excel file (.xlsx) only.")
         return WAITING_FOR_EXCEL
 
 async def handle_shift_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -158,29 +157,27 @@ async def handle_shift_selection(update: Update, context: ContextTypes.DEFAULT_T
     
     await query.edit_message_text(
         f"✅ **Shift {selected_shift}** selected.\n\n"
-        "Please upload the HMI screen photo for Dock 1."
+        "Now send the HMI screen photo for Dock 1."
     )
     return WAITING_FOR_PHOTO
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(EXCEL_FILE_PATH):
-        await update.message.reply_text(
-            "⚠️ Excel file missing! Please send /start or /restart to upload the Excel file first."
-        )
+        await update.message.reply_text("⚠️ Excel file not found! Please send /start or /restart to upload the Excel file first.")
         return WAITING_FOR_EXCEL
 
     photo_file = await update.message.photo[-1].get_file()
     image_path = "temp_dock_image.jpg"
     await photo_file.download_to_drive(image_path)
     
-    await update.message.reply_text("🔎 Processing image and calculating delay...")
+    await update.message.reply_text("🔎 Inspecting photo and calculating delay...")
     
     all_photo_items = extract_photo_details(image_path)
     
     if not all_photo_items:
         await update.message.reply_text(
             "⚠️ Could not detect order details from the image.\n\n"
-            "➡️ Please upload a clearer photo or send the next dock photo."
+            "➡️ Please send the photo for the next dock."
         )
         return WAITING_FOR_PHOTO
 
@@ -190,7 +187,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report_lines = []
     skipped_orders = []
 
-    # CORE DELAY LOGIC
+    # -------------------------------------------------------------------------
+    # CORE DELAY LOGIC:
+    # From all orders found in the photo, if an order belongs to the chosen shift,
+    # locate the order immediately preceding it and calculate:
+    # Previous Order Excel Last Out Time - Current Order Photo Req Time = Delay
+    # -------------------------------------------------------------------------
     for i, item in enumerate(all_photo_items):
         req_t = item['req_time'].time()
         
@@ -207,12 +209,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_order_id = item['order_id']
             current_req_time = item['req_time']
 
-            # Locate previous order item
+            # Find previous order item (could be running order from previous shift)
             if i + 1 < len(all_photo_items):
                 prev_order_item = all_photo_items[i + 1]
                 prev_order_id = prev_order_item['order_id']
                 
-                # Check Last Out Time in Excel for previous order
+                # Check if previous order's Last Out Time exists in Excel
                 prev_out_time = excel_records.get(prev_order_id.lower())
 
                 if prev_out_time:
@@ -226,13 +228,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"   └ ⚠️ **Delay**: **{delay_minutes} Minutes**"
                     )
                 else:
-                    skipped_orders.append(f"{current_order_id} (Prev order {prev_order_id} not found in Excel)")
+                    skipped_orders.append(f"{current_order_id} (Previous order {prev_order_id} not in Excel)")
             else:
                 skipped_orders.append(f"{current_order_id} (Previous order not available in photo)")
 
+    # -------------------------------------------------------------------------
     # REPORT GENERATION & SEQUENTIAL REQUEST
+    # -------------------------------------------------------------------------
     shift_name = f"Shift {selected_shift}"
-    summary_msg = f"📊 **{shift_name} Delay Report Summary**\n\n"
+    summary_msg = f"📊 **{shift_name} Delay Summary Report**\n\n"
 
     if report_lines:
         summary_msg += "\n\n".join(report_lines)
@@ -242,11 +246,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if skipped_orders:
         summary_msg += f"\n\n⚠️ **Skipped Orders**: {', '.join(skipped_orders)}"
 
-    # Send delay report
+    # 1. Send delay report
     await update.message.reply_text(summary_msg, parse_mode='Markdown')
 
-    # Request next photo
-    await update.message.reply_text("➡️ **Send Next Dock Photo (or type /restart to begin a new batch).**")
+    # 2. Prompt for next photo
+    await update.message.reply_text("➡️ **Send Next Dock Photo (or type /restart to reset).**")
 
     # Clean up local image
     if os.path.exists(image_path):
@@ -256,7 +260,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Operation cancelled. Send /start to begin again.")
+    await update.message.reply_text("Processing cancelled. Send /start to begin again.")
     return ConversationHandler.END
 
 # -----------------------------------------------------------------------------
