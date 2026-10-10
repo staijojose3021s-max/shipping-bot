@@ -16,7 +16,7 @@ from telegram.ext import (
 # Un-comment the line below if testing locally on Windows:
 # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-BOT_TOKEN = os.environ.get("8927787436:AAH90ZCxUlhFufKyYLiwa7TADP-KLDs4s3s")
+BOT_TOKEN = os.environ.get("8927787436:AAGeEe7hbnaHmHzSMSS9U1-785rvHtpJo9o")
 EXCEL_FILE_PATH = "dispatch_data.xlsx"
 
 # Conversation States
@@ -264,7 +264,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN APPLICATION
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
-    app = Application.builder().token("8927787436:AAH90ZCxUlhFufKyYLiwa7TADP-KLDs4s3s").build()
+    app = Application.builder().token("8927787436:AAGeEe7hbnaHmHzSMSS9U1-785rvHtpJo9o").build()
 
     conv_handler = ConversationHandler(
         entry_points=[
