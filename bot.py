@@ -60,7 +60,7 @@ def parse_excel_file(file_path):
     return excel_records
 
 def extract_photo_details(image_path):
-    """Extracts Order ID, Req Date, and Req Time from photo and returns as a list (top to bottom)."""
+    """Extracts Order ID (any format), Req Date, and Req Time from photo and returns as a list (top to bottom)."""
     img = Image.open(image_path).convert('L')
     text = pytesseract.image_to_string(img)
     
@@ -68,7 +68,8 @@ def extract_photo_details(image_path):
     extracted_items = []
 
     for line in lines:
-        order_match = re.search(r'MOS\d+', line, re.IGNORECASE)
+        # Flexible Order ID pattern to capture any format (digits, alphanumeric, etc.)
+        order_match = re.search(r'\b[A-Za-z0-9_-]{5,}\b', line)
         date_match = re.search(r'\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}', line)
         time_match = re.search(r'\d{2}:\d{2}:\d{2}', line)
 
@@ -287,3 +288,4 @@ if __name__ == '__main__':
 
     print("Bot is running successfully...")
     app.run_polling()
+
