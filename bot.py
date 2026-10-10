@@ -16,7 +16,7 @@ from telegram.ext import (
 # Un-comment the line below if testing locally on Windows:
 # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-BOT_TOKEN = os.environ.get("8927787436:AAGeEe7hbnaHmHzSMSS9U1-785rvHtpJo9o")
+BOT_TOKEN = os.environ.get("8927787436:AAGMN6zCRJ__7olyCwRrS3PT1ECg8oL9N1Y")
 EXCEL_FILE_PATH = "dispatch_data.xlsx"
 
 # Conversation States
@@ -60,31 +60,50 @@ def parse_excel_file(file_path):
     return excel_records
 
 def extract_photo_details(image_path):
-    """Extracts Order ID (any format), Req Date, and Req Time from photo and returns as a list (top to bottom)."""
+    """Extracts Order ID, Req Date, and Req Time from photo, supporting flexible table layouts."""
     img = Image.open(image_path).convert('L')
     text = pytesseract.image_to_string(img)
     
-    lines = text.split('\n')
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
     extracted_items = []
 
-    for line in lines:
-        # Flexible Order ID pattern to capture any format (digits, alphanumeric, etc.)
+    for i, line in enumerate(lines):
         order_match = re.search(r'\b[A-Za-z0-9_-]{5,}\b', line)
-        date_match = re.search(r'\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}', line)
-        time_match = re.search(r'\d{2}:\d{2}:\d{2}', line)
+        if not order_match:
+            continue
 
-        if order_match and date_match and time_match:
-            photo_order_id = order_match.group(0).strip()
-            datetime_str = f"{date_match.group(0)} {time_match.group(0)}"
+        photo_order_id = order_match.group(0).strip()
+        if photo_order_id.lower() in ['order', 'status', 'vehicle', 'dock', 'shipping']:
+            continue
+
+        date_match = re.search(r'\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}', line)
+        time_match = re.search(r'\d{2}[:\.]\d{2}[:\.]\d{2}', line)
+
+        if not (date_match and time_match):
+            search_window = lines[max(0, i-2):min(len(lines), i+3)]
+            combined_window = " ".join(search_window)
+            if not date_match:
+                date_match = re.search(r'\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}', combined_window)
+            if not time_match:
+                time_match = re.search(r'\d{2}[:\.]\d{2}[:\.]\d{2}', combined_window)
+
+        if date_match and time_match:
+            time_str_clean = time_match.group(0).replace('.', ':')
+            datetime_str = f"{date_match.group(0)} {time_str_clean}"
+            
             try:
                 photo_time = datetime.strptime(datetime_str, "%d-%m-%Y %H:%M:%S")
             except ValueError:
-                photo_time = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+                try:
+                    photo_time = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
 
-            extracted_items.append({
-                'order_id': photo_order_id,
-                'req_time': photo_time
-            })
+            if not any(item['order_id'] == photo_order_id for item in extracted_items):
+                extracted_items.append({
+                    'order_id': photo_order_id,
+                    'req_time': photo_time
+                })
 
     return extracted_items
 
@@ -265,7 +284,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN APPLICATION
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
-    app = Application.builder().token("8927787436:AAGeEe7hbnaHmHzSMSS9U1-785rvHtpJo9o").build()
+    app = Application.builder().token("8927787436:AAGMN6zCRJ__7olyCwRrS3PT1ECg8oL9N1Y").build()
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -288,4 +307,5 @@ if __name__ == '__main__':
 
     print("Bot is running successfully...")
     app.run_polling()
+
 
