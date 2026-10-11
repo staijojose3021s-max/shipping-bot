@@ -1,11 +1,9 @@
-
-
-
 import os
+import re
 import pandas as pd
-import datetime as dt
-import zipfile
-import shutil
+import numpy as np
+from PIL import Image
+import easyocr
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
@@ -15,114 +13,115 @@ from telegram.ext import (
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("8927787436:AAFOKgAY_iVc0jEn_dt2TQTl7Qw_W9nn47E")
-INPUT_EXCEL_PATH = "input_dispatch.xlsx"
-OUTPUT_EXCEL_PATH = "cleaned_dispatch_data.xlsx"
+TEMP_IMAGE_PATH = "temp_dock_image.jpg"
+OUTPUT_EXCEL_PATH = "dock_extracted_data.xlsx"
 
-# Conversation State
-WAITING_FOR_EXCEL = range(1)
+WAITING_FOR_PHOTO = 1
+
+# Initialize EasyOCR Reader
+print("Initializing EasyOCR Model...")
+reader = easyocr.Reader(['en'], gpu=False)
 
 # -----------------------------------------------------------------------------
-# EXCEL HELPER FUNCTION
+# EASYOCR PROCESSING FUNCTION (FIXED)
 # -----------------------------------------------------------------------------
-def process_and_clean_excel(file_path, output_path):
-    """
-    Cleans metadata to prevent openpyxl crashes, dynamically extracts 'Order ID' 
-    and 'Last Out Time' columns, groups by 'Order ID' to keep only the latest 
-    (maximum) 'Last Out Time', and saves to a new Excel file.
-    """
-    # 1. Clean metadata to prevent openpyxl core.xml crashes
-    try:
-        temp_path = file_path + ".tmp"
-        with zipfile.ZipFile(file_path, 'r') as zin:
-            with zipfile.ZipFile(temp_path, 'w') as zout:
-                for item in zin.infolist():
-                    if item.filename == 'docProps/core.xml':
-                        continue
-                    zout.writestr(item, zin.read(item.filename))
-        shutil.move(temp_path, file_path)
-    except Exception as e:
-        print(f"Sanitization warning: {e}")
+def process_dock_photo_easyocr(image_path, output_excel_path):
+    results = reader.readtext(image_path)
+    if not results:
+        raise ValueError("ഫോട്ടോയിൽ നിന്ന് വിവരങ്ങളൊന്നും വായിക്കാൻ കഴിഞ്ഞില്ല. കൂടുതൽ വ്യക്തതയുള്ള ഫോട്ടോ അയക്കുക.")
 
-    # 2. Read workbook data
-    import openpyxl
-    wb = openpyxl.load_workbook(file_path, data_only=True)
-    sheet = wb.active
-    
-    data = []
-    headers = []
-    for i, row in enumerate(sheet.iter_rows(values_only=True)):
-        if i == 0:
-            headers = [str(cell).strip() if cell is not None else f"Unnamed_{j}" for j, cell in enumerate(row)]
-            continue
-        if any(row):
-            data.append(row)
-            
-    df = pd.DataFrame(data, columns=headers)
-    df.columns = df.columns.astype(str).str.strip()
-
-    # 3. Dynamic Header Search for Order ID
-    order_col = None
-    target_order_headers = [
-        'ship order id', 'shipping order id', 'shipping order number',
-        'ship order no', 'shipping order', 'ship_order_no', 'order id', 'order_id', 'order no', 'order number'
-    ]
-    for col in df.columns:
-        if col.lower().strip() in target_order_headers:
-            order_col = col
-            break
-    if not order_col:
-        order_col = df.columns[0]
-
-    # 4. Dynamic Header Search for Last Out Time
-    time_col = None
-    target_time_headers = ['last out time', 'req date', 'req time', 'out time', 'request time', 'last_out_time', 'gnt out date']
-    for col in df.columns:
-        if col.lower().strip() in target_time_headers:
-            time_col = col
-            break
-    if not time_col:
-        time_col = df.columns[-1]
-
-    # 5. Extract and parse datetime objects safely
-    parsed_records = []
-    for _, row in df.iterrows():
-        order_id = str(row[order_col]).strip()
-        if not order_id or order_id.lower() in ['none', 'nan', '']:
-            continue
-            
-        val = row[time_col]
-        try:
-            if isinstance(val, (dt.datetime, dt.date)):
-                parsed_time = val if isinstance(val, dt.datetime) else dt.datetime.combine(val, dt.time.min)
-            else:
-                parsed_time = pd.to_datetime(str(val), dayfirst=True, errors='coerce')
-                if pd.isna(parsed_time):
-                    continue
-                parsed_time = parsed_time.to_pydatetime()
-        except Exception as e:
-            print(f"Error parsing date for order {order_id}: {e}")
-            continue
-
-        parsed_records.append({
-            'Order ID': order_id,
-            'Last Out Time': parsed_time
+    # 1. Safe parsing of bounding boxes
+    parsed_boxes = []
+    for bbox, text, prob in results:
+        # bbox contains 4 points: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+        top_y = min(pt[1] for pt in bbox)
+        bottom_y = max(pt[1] for pt in bbox)
+        center_y = (top_y + bottom_y) / 2
+        min_x = min(pt[0] for pt in bbox)
+        
+        parsed_boxes.append({
+            'center_y': center_y,
+            'min_x': min_x,
+            'text': text.strip(),
+            'prob': prob
         })
 
-    if not parsed_records:
-        raise ValueError("No valid records found in the uploaded Excel file.")
+    # Sort boxes top-to-bottom
+    parsed_boxes = sorted(parsed_boxes, key=lambda b: b['center_y'])
 
-    # 6. Convert to DataFrame and Group By 'Order ID' to get the latest (maximum) time
-    temp_df = pd.DataFrame(parsed_records)
-    grouped_df = temp_df.groupby('Order ID', as_index=False)['Last Out Time'].max()
+    # 2. Group items into distinct horizontal rows (threshold = 15 pixels)
+    rows = []
+    current_row = []
+    last_y = None
 
-    # 7. Format datetime safely back to standard string format
-    grouped_df['Last Out Time'] = grouped_df['Last Out Time'].apply(
-        lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) and isinstance(x, (dt.datetime, dt.date)) else str(x)
-    )
+    for box in parsed_boxes:
+        if last_y is None or abs(box['center_y'] - last_y) < 18:
+            current_row.append(box)
+            last_y = box['center_y']
+        else:
+            rows.append(sorted(current_row, key=lambda b: b['min_x']))
+            current_row = [box]
+            last_y = box['center_y']
 
-    # 8. Save extracted unique data to a new Excel file
-    grouped_df.to_excel(output_path, index=False, engine='openpyxl')
-    return len(grouped_df)
+    if current_row:
+        rows.append(sorted(current_row, key=lambda b: b['min_x']))
+
+    extracted_records = []
+
+    # 3. Process every table row
+    for row_boxes in rows:
+        row_text = " ".join([b['text'] for b in row_boxes])
+
+        # Match 'MOS' Order Number (supporting variations)
+        order_match = re.search(r'\b(M[O0][S5]\d+)\b', row_text, re.IGNORECASE)
+        if not order_match:
+            alt_match = re.search(r'\b(\d{10,14})\b', row_text)
+            if alt_match:
+                ship_order_no = "MOS" + alt_match.group(1)
+            else:
+                continue
+        else:
+            raw_id = order_match.group(1).upper()
+            ship_order_no = re.sub(r'^M[O0][S5]', 'MOS', raw_id)
+
+        # Extract Date
+        date_match = re.search(r'\b\d{2}[-/\.]\d{2}[-/\.]\d{4}\b|\b\d{4}[-/\.]\d{2}[-/\.]\d{2}\b', row_text)
+        req_date = date_match.group(0).replace('/', '-').replace('.', '-') if date_match else "N/A"
+
+        # Extract Time
+        time_match = re.search(r'\b\d{2}[\.:\s]\d{2}[\.:\s]\d{2}\b', row_text)
+        req_time = re.sub(r'[\.\s]', ':', time_match.group(0)) if time_match else "N/A"
+
+        # Determine Row-Specific Dock No safely
+        dock_no = "1"
+        mos_index = -1
+        for idx, box in enumerate(row_boxes):
+            if re.search(r'M[O0][S5]\d+|\d{10,14}', box['text'], re.IGNORECASE):
+                mos_index = idx
+                break
+
+        if mos_index != -1 and mos_index + 1 < len(row_boxes):
+            next_token = row_boxes[mos_index + 1]['text']
+            dock_match = re.search(r'\b\d{1,2}\b', next_token)
+            if dock_match:
+                dock_no = dock_match.group(0)
+
+        # Append row details (deduplicating by Ship Order No)
+        if not any(rec['Ship Order No'] == ship_order_no for rec in extracted_records):
+            extracted_records.append({
+                'Ship Order No': ship_order_no,
+                'Dock No': dock_no,
+                'Req Date': req_date,
+                'Req Time': req_time
+            })
+
+    if not extracted_records:
+        raise ValueError("ഫോട്ടോയിൽ നിന്ന് ഓർഡർ നമ്പറുകൾ കണ്ടെത്താനായില്ല. ദയവായി സ്ക്രീൻ കുറച്ചുകൂടി വ്യക്തമായി എടുത്ത് അയക്കുക.")
+
+    # Save all captured rows to Excel
+    df = pd.DataFrame(extracted_records, columns=['Ship Order No', 'Dock No', 'Req Date', 'Req Time'])
+    df.to_excel(output_excel_path, index=False, engine='openpyxl')
+    return len(extracted_records)
 
 # -----------------------------------------------------------------------------
 # TELEGRAM BOT HANDLERS
@@ -130,45 +129,36 @@ def process_and_clean_excel(file_path, output_path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
-        "👋 Welcome to the Excel Processing Bot!\n\n"
-        "Please upload your Excel file (.xlsx) containing dispatch details."
+        "👋 സ്വാഗതം!\n\n"
+        "ഡോക്കിന്റെ HMI ഫോട്ടോ അയച്ചു തരൂ. എല്ലാ ഓർഡറുകളും അതാത് ഡോക്ക് നമ്പറും കൃത്യമായി എക്സൽ ഫയലാക്കി ഞാൻ തിരികെ തരാം."
     )
-    return WAITING_FOR_EXCEL
+    return WAITING_FOR_PHOTO
 
-async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if doc.file_name.endswith(('.xlsx', '.xls')):
-        await update.message.reply_text("📥 Excel file received! Filtering latest Last Out Time per Order ID...")
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔎 ഫോട്ടോ പ്രോസസ്സ് ചെയ്ത് വിവരങ്ങൾ എക്സ്ട്രാക്ട് ചെയ്യുന്നു...")
+    photo_file = await update.message.photo[-1].get_file()
+    await photo_file.download_to_drive(TEMP_IMAGE_PATH)
+    
+    try:
+        total_rows = process_dock_photo_easyocr(TEMP_IMAGE_PATH, OUTPUT_EXCEL_PATH)
+        with open(OUTPUT_EXCEL_PATH, 'rb') as excel_file:
+            await update.message.reply_document(
+                document=excel_file,
+                filename="dock_extracted_data.xlsx",
+                caption=f"✅ പ്രോസസ്സിംഗ് പൂർത്തിയായി!\n\n📊 ആകെ കണ്ടെത്തിയ ഓർഡറുകൾ: {total_rows}"
+            )
+        await update.message.reply_text("➡️ അടുത്ത ഫോട്ടോ അയക്കൂ (അല്ലെങ്കിൽ /restart ചെയ്യുക).")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ എറർ: {str(e)}")
         
-        file = await doc.get_file()
-        await file.download_to_drive(INPUT_EXCEL_PATH)
-        
-        try:
-            total_rows = process_and_clean_excel(INPUT_EXCEL_PATH, OUTPUT_EXCEL_PATH)
-            
-            # Send the newly created Excel file back to user
-            with open(OUTPUT_EXCEL_PATH, 'rb') as excel_file:
-                await update.message.reply_document(
-                    document=excel_file,
-                    filename="cleaned_dispatch_data.xlsx",
-                    caption=f"✅ Processing complete!\n\n📊 Unique Orders Extracted: {total_rows}"
-                )
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ Error processing file: {str(e)}")
-            
-        # Clean up local files
-        for path in [INPUT_EXCEL_PATH, OUTPUT_EXCEL_PATH]:
-            if os.path.exists(path):
-                os.remove(path)
-                
-        return WAITING_FOR_EXCEL
-    else:
-        await update.message.reply_text("⚠️ Please upload a valid Excel file (.xlsx or .xls) only.")
-        return WAITING_FOR_EXCEL
+    for path in [TEMP_IMAGE_PATH, OUTPUT_EXCEL_PATH]:
+        if os.path.exists(path):
+            os.remove(path)
+    return WAITING_FOR_PHOTO
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Processing cancelled. Send /start to begin again.")
+    await update.message.reply_text("പ്രോസസ്സിംഗ് റദ്ദാക്കി. വീണ്ടും ആരംഭിക്കാൻ /start ചെയ്യുക.")
     return ConversationHandler.END
 
 # -----------------------------------------------------------------------------
@@ -176,20 +166,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
     app = Application.builder().token("8927787436:AAFOKgAY_iVc0jEn_dt2TQTl7Qw_W9nn47E").build()
-
     conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('start', start)
-        ],
-        states={
-            WAITING_FOR_EXCEL: [MessageHandler(filters.Document.ALL, handle_excel)],
-        },
-        fallbacks=[
-            CommandHandler('cancel', cancel)
-        ],
+        entry_points=[CommandHandler('start', start), CommandHandler('restart', start)],
+        states={WAITING_FOR_PHOTO: [MessageHandler(filters.PHOTO, handle_photo)]},
+        fallbacks=[CommandHandler('cancel', cancel), CommandHandler('restart', start)],
     )
-
     app.add_handler(conv_handler)
-
-    print("Bot is running successfully...")
+    print("Telegram Bot running successfully...")
     app.run_polling()
