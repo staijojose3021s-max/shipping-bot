@@ -1,164 +1,247 @@
 import os
 import re
 import pandas as pd
-import numpy as np
 from PIL import Image
-import easyocr
-from telegram import Update
+import pytesseract
+from datetime import datetime, time
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, ContextTypes, ConversationHandler
 )
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("8927787436:AAFOKgAY_iVc0jEn_dt2TQTl7Qw_W9nn47E")
-TEMP_IMAGE_PATH = "temp_dock_image.jpg"
-OUTPUT_EXCEL_PATH = "dock_extracted_data.xlsx"
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-WAITING_FOR_PHOTO = 1
+BOT_TOKEN = "8927787436:AAFOKgAY_iVc0jEn_dt2TQTl7Qw_W9nn47E"
+EXCEL_FILE_PATH = "dispatch_data.xlsx"
 
-# Initialize EasyOCR Reader
-print("Initializing EasyOCR Model...")
-reader = easyocr.Reader(['en'], gpu=False)
+# Conversation States
+WAITING_FOR_EXCEL, WAITING_FOR_SHIFT, WAITING_FOR_PHOTO = range(3)
 
 # -----------------------------------------------------------------------------
-# EASYOCR PROCESSING FUNCTION (FIXED)
+# EXCEL & OCR HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
-def process_dock_photo_easyocr(image_path, output_excel_path):
-    results = reader.readtext(image_path)
-    if not results:
-        raise ValueError("ഫോട്ടോയിൽ നിന്ന് വിവരങ്ങളൊന്നും വായിക്കാൻ കഴിഞ്ഞില്ല. കൂടുതൽ വ്യക്തതയുള്ള ഫോട്ടോ അയക്കുക.")
-
-    # 1. Safe parsing of bounding boxes
-    parsed_boxes = []
-    for bbox, text, prob in results:
-        # bbox contains 4 points: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-        top_y = min(pt[1] for pt in bbox)
-        bottom_y = max(pt[1] for pt in bbox)
-        center_y = (top_y + bottom_y) / 2
-        min_x = min(pt[0] for pt in bbox)
+def parse_excel_file(file_path):
+    """Excel ഫയൽ വായിച്ച് Order ID അടിസ്ഥാനമാക്കി Last Out Time നിഘണ്ടു (Dictionary) ഉണ്ടാക്കുന്നു."""
+    df = pd.read_excel(file_path)
+    df.columns = df.columns.astype(str).str.strip()
+    
+    # Flexible Header Search for Order ID
+    order_col = None
+    for col in df.columns:
+        if col.lower() in ['ship order no', 'order id', 'shipping order', 'ship_order_no', 'order_id']:
+            order_col = col
+            break
+    if not order_col:
+        order_col = df.columns[0]
         
-        parsed_boxes.append({
-            'center_y': center_y,
-            'min_x': min_x,
-            'text': text.strip(),
-            'prob': prob
-        })
+    # Flexible Header Search for Last Out Time
+    time_col = None
+    for col in df.columns:
+        if col.lower() in ['last out time', 'req date', 'req time', 'out time', 'request time', 'last_out_time']:
+            time_col = col
+            break
+    if not time_col:
+        time_col = df.columns[-1]
 
-    # Sort boxes top-to-bottom
-    parsed_boxes = sorted(parsed_boxes, key=lambda b: b['center_y'])
+    excel_records = {}
+    for _, row in df.iterrows():
+        order_id = str(row[order_col]).strip()
+        try:
+            parsed_time = pd.to_datetime(str(row[time_col]), dayfirst=True).to_pydatetime()
+            excel_records[order_id.lower()] = parsed_time
+        except Exception:
+            continue
+            
+    return excel_records
 
-    # 2. Group items into distinct horizontal rows (threshold = 15 pixels)
-    rows = []
-    current_row = []
-    last_y = None
+def extract_photo_details(image_path):
+    """ഫോട്ടോയിൽ നിന്ന് Order ID, Req Date, Req Time എന്നിവ എടുത്ത് ലിസ്റ്റ് ആയി നൽകുന്നു (മേൽ നിന്ന് താഴേക്ക്)."""
+    img = Image.open(image_path).convert('L')
+    text = pytesseract.image_to_string(img)
+    
+    lines = text.split('\n')
+    extracted_items = []
 
-    for box in parsed_boxes:
-        if last_y is None or abs(box['center_y'] - last_y) < 18:
-            current_row.append(box)
-            last_y = box['center_y']
-        else:
-            rows.append(sorted(current_row, key=lambda b: b['min_x']))
-            current_row = [box]
-            last_y = box['center_y']
+    for line in lines:
+        order_match = re.search(r'MOS\d+', line, re.IGNORECASE)
+        date_match = re.search(r'\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}', line)
+        time_match = re.search(r'\d{2}:\d{2}:\d{2}', line)
 
-    if current_row:
-        rows.append(sorted(current_row, key=lambda b: b['min_x']))
+        if order_match and date_match and time_match:
+            photo_order_id = order_match.group(0).strip()
+            datetime_str = f"{date_match.group(0)} {time_match.group(0)}"
+            try:
+                photo_time = datetime.strptime(datetime_str, "%d-%m-%Y %H:%M:%S")
+            except ValueError:
+                photo_time = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
 
-    extracted_records = []
-
-    # 3. Process every table row
-    for row_boxes in rows:
-        row_text = " ".join([b['text'] for b in row_boxes])
-
-        # Match 'MOS' Order Number (supporting variations)
-        order_match = re.search(r'\b(M[O0][S5]\d+)\b', row_text, re.IGNORECASE)
-        if not order_match:
-            alt_match = re.search(r'\b(\d{10,14})\b', row_text)
-            if alt_match:
-                ship_order_no = "MOS" + alt_match.group(1)
-            else:
-                continue
-        else:
-            raw_id = order_match.group(1).upper()
-            ship_order_no = re.sub(r'^M[O0][S5]', 'MOS', raw_id)
-
-        # Extract Date
-        date_match = re.search(r'\b\d{2}[-/\.]\d{2}[-/\.]\d{4}\b|\b\d{4}[-/\.]\d{2}[-/\.]\d{2}\b', row_text)
-        req_date = date_match.group(0).replace('/', '-').replace('.', '-') if date_match else "N/A"
-
-        # Extract Time
-        time_match = re.search(r'\b\d{2}[\.:\s]\d{2}[\.:\s]\d{2}\b', row_text)
-        req_time = re.sub(r'[\.\s]', ':', time_match.group(0)) if time_match else "N/A"
-
-        # Determine Row-Specific Dock No safely
-        dock_no = "1"
-        mos_index = -1
-        for idx, box in enumerate(row_boxes):
-            if re.search(r'M[O0][S5]\d+|\d{10,14}', box['text'], re.IGNORECASE):
-                mos_index = idx
-                break
-
-        if mos_index != -1 and mos_index + 1 < len(row_boxes):
-            next_token = row_boxes[mos_index + 1]['text']
-            dock_match = re.search(r'\b\d{1,2}\b', next_token)
-            if dock_match:
-                dock_no = dock_match.group(0)
-
-        # Append row details (deduplicating by Ship Order No)
-        if not any(rec['Ship Order No'] == ship_order_no for rec in extracted_records):
-            extracted_records.append({
-                'Ship Order No': ship_order_no,
-                'Dock No': dock_no,
-                'Req Date': req_date,
-                'Req Time': req_time
+            extracted_items.append({
+                'order_id': photo_order_id,
+                'req_time': photo_time
             })
 
-    if not extracted_records:
-        raise ValueError("ഫോട്ടോയിൽ നിന്ന് ഓർഡർ നമ്പറുകൾ കണ്ടെത്താനായില്ല. ദയവായി സ്ക്രീൻ കുറച്ചുകൂടി വ്യക്തമായി എടുത്ത് അയക്കുക.")
+    return extracted_items
 
-    # Save all captured rows to Excel
-    df = pd.DataFrame(extracted_records, columns=['Ship Order No', 'Dock No', 'Req Date', 'Req Time'])
-    df.to_excel(output_excel_path, index=False, engine='openpyxl')
-    return len(extracted_records)
+def filter_by_shift(items, selected_shift):
+    """തിരഞ്ഞെടുത്ത ഷിഫ്റ്റിന് അനുയോജ്യമായ ഓർഡറുകൾ മാത്രം ഫിൽട്ടർ ചെയ്യുന്നു."""
+    filtered = []
+    for item in items:
+        t = item['req_time'].time()
+        
+        # A Shift: 07:00 AM - 03:00 PM (15:00)
+        if selected_shift == 'A' and time(7, 0) <= t < time(15, 0):
+            filtered.append(item)
+        # B Shift: 03:00 PM (15:00) - 11:00 PM (23:00)
+        elif selected_shift == 'B' and time(15, 0) <= t < time(23, 0):
+            filtered.append(item)
+        # C Shift: 11:00 PM (23:00) - 07:00 AM (Next Day)
+        elif selected_shift == 'C' and (t >= time(23, 0) or t < time(7, 0)):
+            filtered.append(item)
+            
+    return filtered
 
 # -----------------------------------------------------------------------------
 # TELEGRAM BOT HANDLERS
 # -----------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
     await update.message.reply_text(
-        "👋 സ്വാഗതം!\n\n"
-        "ഡോക്കിന്റെ HMI ഫോട്ടോ അയച്ചു തരൂ. എല്ലാ ഓർഡറുകളും അതാത് ഡോക്ക് നമ്പറും കൃത്യമായി എക്സൽ ഫയലാക്കി ഞാൻ തിരികെ തരാം."
+        "👋 ഹലോ! ഷിപ്പിംഗ് ഡിലേ ട്രാക്കിംഗ് ബോട്ടിലേക്ക് സ്വാഗതം.\n\n"
+        "തുടങ്ങാനായി എക്സൽ ഫയൽ (.xlsx) ഇവിടെ അയക്കുക."
+    )
+    return WAITING_FOR_EXCEL
+
+async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if doc.file_name.endswith(('.xlsx', '.xls')):
+        file = await doc.get_file()
+        await file.download_to_drive(EXCEL_FILE_PATH)
+        
+        # Shift selection buttons
+        keyboard = [
+            [InlineKeyboardButton("A Shift (07:00 AM - 03:00 PM)", callback_data='A')],
+            [InlineKeyboardButton("B Shift (03:00 PM - 11:00 PM)", callback_data='B')],
+            [InlineKeyboardButton("C Shift (11:00 PM - 07:00 AM)", callback_data='C')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text("✅ എക്സൽ ഫയൽ സേവ് ചെയ്തു!\n\nദയവായി ഷിഫ്റ്റ് (Shift) തിരഞ്ഞെടുക്കുക:", reply_markup=reply_markup)
+        return WAITING_FOR_SHIFT
+    else:
+        await update.message.reply_text("⚠️ ദയവായി ഒരു എക്സൽ ഫയൽ (.xlsx) മാത്രം അയക്കുക.")
+        return WAITING_FOR_EXCEL
+
+async def handle_shift_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    selected_shift = query.data
+    context.user_data['selected_shift'] = selected_shift
+    
+    await query.edit_message_text(
+        f"✅ **Shift {selected_shift}** തിരഞ്ഞെടുത്തു.\n\n"
+        "ഇനി ആദ്യത്തെ ഡോക്കിന്റെ (Dock 1) HMI സ്ക്രീൻ ഫോട്ടോ അയച്ചു തരൂ."
     )
     return WAITING_FOR_PHOTO
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔎 ഫോട്ടോ പ്രോസസ്സ് ചെയ്ത് വിവരങ്ങൾ എക്സ്ട്രാക്ട് ചെയ്യുന്നു...")
+    if not os.path.exists(EXCEL_FILE_PATH):
+        await update.message.reply_text("⚠️ എക്സൽ ഫയൽ കാണാനില്ല! ദയവായി ആദ്യമേ /start കൊടുത്ത് എക്സൽ അയക്കൂ.")
+        return WAITING_FOR_EXCEL
+
     photo_file = await update.message.photo[-1].get_file()
-    await photo_file.download_to_drive(TEMP_IMAGE_PATH)
+    image_path = "temp_dock_image.jpg"
+    await photo_file.download_to_drive(image_path)
     
-    try:
-        total_rows = process_dock_photo_easyocr(TEMP_IMAGE_PATH, OUTPUT_EXCEL_PATH)
-        with open(OUTPUT_EXCEL_PATH, 'rb') as excel_file:
-            await update.message.reply_document(
-                document=excel_file,
-                filename="dock_extracted_data.xlsx",
-                caption=f"✅ പ്രോസസ്സിംഗ് പൂർത്തിയായി!\n\n📊 ആകെ കണ്ടെത്തിയ ഓർഡറുകൾ: {total_rows}"
-            )
-        await update.message.reply_text("➡️ അടുത്ത ഫോട്ടോ അയക്കൂ (അല്ലെങ്കിൽ /restart ചെയ്യുക).")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ എറർ: {str(e)}")
+    await update.message.reply_text("🔎 ഫോട്ടോ പരിശോധിച്ചു ഡിലേ കണക്കാക്കുന്നു...")
+    
+    all_photo_items = extract_photo_details(image_path)
+    
+    if not all_photo_items:
+        await update.message.reply_text(
+            "⚠️ ഫോട്ടോയിൽ നിന്ന് ഓർഡറുകൾ കണ്ടെത്താനായില്ല.\n\n"
+            "➡️ ദയവായി അടുത്ത ഡോക്കിന്റെ ഫോട്ടോ അയക്കുക."
+        )
+        return WAITING_FOR_PHOTO
+
+    selected_shift = context.user_data.get('selected_shift', 'C')
+    excel_records = parse_excel_file(EXCEL_FILE_PATH)
+    
+    report_lines = []
+    skipped_orders = []
+
+    # -------------------------------------------------------------------------
+    # CORE DELAY LOGIC:
+    # ഫോട്ടോയിലുള്ള എല്ലാ ഓർഡറുകളുടെയും ലിസ്റ്റിൽ നിന്ന്
+    # തിരഞ്ഞെടുത്ത് വച്ച ഷിഫ്റ്റിലെ ഓർഡർ ആണെങ്കിൽ, അതിന് തൊട്ടുമുമ്പത്തെ ഓർഡർ ഏതെന്ന് കണ്ടെത്തി
+    # ആ മുൻ ഓർഡറിന്റെ Excel Last Out Time - പുതിയ ഓർഡറിന്റെ Photo Req Time = Delay
+    # -------------------------------------------------------------------------
+    for i, item in enumerate(all_photo_items):
+        req_t = item['req_time'].time()
         
-    for path in [TEMP_IMAGE_PATH, OUTPUT_EXCEL_PATH]:
-        if os.path.exists(path):
-            os.remove(path)
+        # Check if this item belongs to current shift
+        is_in_shift = False
+        if selected_shift == 'A' and time(7, 0) <= req_t < time(15, 0):
+            is_in_shift = True
+        elif selected_shift == 'B' and time(15, 0) <= req_t < time(23, 0):
+            is_in_shift = True
+        elif selected_shift == 'C' and (req_t >= time(23, 0) or req_t < time(7, 0)):
+            is_in_shift = True
+
+        if is_in_shift:
+            current_order_id = item['order_id']
+            current_req_time = item['req_time']
+
+            # തൊട്ടുമുമ്പത്തെ ഓർഡർ കണ്ടെത്തുന്നു (മുമ്പത്തെ ഷിഫ്റ്റിലെ റണ്ണിംഗ് ഓർഡർ ആയിരിക്കാം)
+            if i + 1 < len(all_photo_items):
+                prev_order_item = all_photo_items[i + 1]
+                prev_order_id = prev_order_item['order_id']
+                
+                # എക്സലിൽ തൊട്ടുമുമ്പത്തെ ഓർഡറിന്റെ Last Out Time ഉണ്ടോ എന്ന് നോക്കുന്നു
+                prev_out_time = excel_records.get(prev_order_id.lower())
+
+                if prev_out_time:
+                    time_diff = current_req_time - prev_out_time
+                    delay_minutes = int(time_diff.total_seconds() / 60)
+
+                    report_lines.append(
+                        f"🔹 **Order ID**: {current_order_id}\n"
+                        f"   ├ Previous Order ({prev_order_id}) Excel Out Time: {prev_out_time.strftime('%d-%m-%Y %H:%M:%S')}\n"
+                        f"   ├ Current Req Time (Photo): {current_req_time.strftime('%d-%m-%Y %H:%M:%S')}\n"
+                        f"   └ ⚠️ **Delay**: **{delay_minutes} മിനിറ്റ്**"
+                    )
+                else:
+                    skipped_orders.append(f"{current_order_id} (മുൻ ഓർഡർ {prev_order_id} എക്സലിൽ ഇല്ല)")
+            else:
+                skipped_orders.append(f"{current_order_id} (തൊട്ടുമുമ്പത്തെ ഓർഡർ ഫോട്ടോയിൽ ലഭ്യമല്ല)")
+
+    # -------------------------------------------------------------------------
+    # REPORT GENERATION & SEQUENTIAL REQUEST
+    # -------------------------------------------------------------------------
+    shift_name = f"Shift {selected_shift}"
+    summary_msg = f"📊 **{shift_name} ഡിലേ റിപ്പോർട്ട് (Delay Summary)**\n\n"
+
+    if report_lines:
+        summary_msg += "\n\n".join(report_lines)
+    else:
+        summary_msg += "ഈ ഷിഫ്റ്റിൽ കണക്കാക്കാൻ സാധിക്കുന്ന ഓർഡറുകൾ ഒന്നും കണ്ടെത്തിയില്ല."
+
+    if skipped_orders:
+        summary_msg += f"\n\n⚠️ **സ്കിപ്പ് ചെയ്തവ**: {', '.join(skipped_orders)}"
+
+    # 1. റിപ്പോർട്ട് അയക്കുന്നു
+    await update.message.reply_text(summary_msg, parse_mode='Markdown')
+
+    # 2. അടുത്ത ഫോട്ടോ അയക്കാനുള്ള മെസ്സേജ്
+    await update.message.reply_text("➡️ **അടുത്ത ഡോക്കിന്റെ ഫോട്ടോ അയക്കുക (Send Next Dock Photo).**")
+
     return WAITING_FOR_PHOTO
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("പ്രോസസ്സിംഗ് റദ്ദാക്കി. വീണ്ടും ആരംഭിക്കാൻ /start ചെയ്യുക.")
+    await update.message.reply_text("പ്രോസസ്സിംഗ് നിർത്തിവച്ചു. വീണ്ടും തുടങ്ങാൻ /start നൽകുക.")
     return ConversationHandler.END
 
 # -----------------------------------------------------------------------------
@@ -166,11 +249,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
     app = Application.builder().token("8927787436:AAFOKgAY_iVc0jEn_dt2TQTl7Qw_W9nn47E").build()
+
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start), CommandHandler('restart', start)],
-        states={WAITING_FOR_PHOTO: [MessageHandler(filters.PHOTO, handle_photo)]},
-        fallbacks=[CommandHandler('cancel', cancel), CommandHandler('restart', start)],
+        entry_points=[CommandHandler('start', start)],
+        states={
+            WAITING_FOR_EXCEL: [MessageHandler(filters.Document.ALL, handle_excel)],
+            WAITING_FOR_SHIFT: [CallbackQueryHandler(handle_shift_selection)],
+            WAITING_FOR_PHOTO: [MessageHandler(filters.PHOTO, handle_photo)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
     )
+
     app.add_handler(conv_handler)
-    print("Telegram Bot running successfully...")
+
+    print("Bot is running successfully...")
     app.run_polling()
