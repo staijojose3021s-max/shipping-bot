@@ -14,7 +14,7 @@ from telegram.ext import (
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("8927787436:AAH5Bq7JoziPGtlXH3ii9ZOP7aOsOTSZleI")
+BOT_TOKEN = os.environ.get("8927787436:AAFOKgAY_iVc0jEn_dt2TQTl7Qw_W9nn47E")
 INPUT_EXCEL_PATH = "input_dispatch.xlsx"
 OUTPUT_EXCEL_PATH = "cleaned_dispatch_data.xlsx"
 
@@ -175,7 +175,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN APPLICATION
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
-    app = Application.builder().token("8927787436:AAH5Bq7JoziPGtlXH3ii9ZOP7aOsOTSZleI").build()
+    app = Application.builder().token("8927787436:AAFOKgAY_iVc0jEn_dt2TQTl7Qw_W9nn47E").build()
 
     conv_handler = ConversationHandler(
         entry_points=[
